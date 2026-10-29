@@ -1,0 +1,9 @@
+# Binaries
+sni-browser-linux-amd64
+sni-browser-windows-amd64.exe
+
+# Go
+*.o
+*.a
+*.so
+vendor/

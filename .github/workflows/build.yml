@@ -1,0 +1,73 @@
+name: build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Install WebKit deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+      - name: Build
+        run: |
+          export PKG_CONFIG_PATH="$(pwd)/pkgconfig:${PKG_CONFIG_PATH:-}"
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -ldflags="-s -w" -o sni-browser-linux-amd64 .
+      - name: Test
+        run: |
+          export PKG_CONFIG_PATH="$(pwd)/pkgconfig:${PKG_CONFIG_PATH:-}"
+          CGO_ENABLED=1 go test ./...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sni-browser-linux-amd64
+          path: sni-browser-linux-amd64
+
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Install MinGW
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+      - name: Build
+        run: |
+          export CGO_CXXFLAGS="-I$(pwd)/winsdk ${CGO_CXXFLAGS:-}"
+          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 \
+            CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+            go build -ldflags="-s -w -H=windowsgui" -o sni-browser-windows-amd64.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sni-browser-windows-amd64
+          path: sni-browser-windows-amd64.exe
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sni-browser-linux-amd64/sni-browser-linux-amd64
+            sni-browser-windows-amd64/sni-browser-windows-amd64.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
