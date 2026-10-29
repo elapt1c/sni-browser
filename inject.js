@@ -1,86 +1,102 @@
-// SNI Browser — persistent in-page browser chrome (toolbar + URL bar).
-// Re-injected after every navigation by the native side (webview.go).
+// SNI Browser — persistent in-page browser chrome.
+// Injected at document-start on every top-frame page via the native side's
+// Init() (WebKitGTK user-content manager / WebView2 document-created hook),
+// so it survives navigation without polling.
 (function () {
     if (window.__sni_injected) return;
-    if (!document.body) return; // retry on a later tick
-    if (window !== window.top) return; // skip iframes
     window.__sni_injected = true;
 
     var H = 40;
 
-    var bar = document.createElement('div');
-    bar.id = '__sni_bar';
-    bar.innerHTML =
-        '<button data-act="back" title="Back">\u25C0</button>' +
-        '<button data-act="fwd" title="Forward">\u25B6</button>' +
-        '<button data-act="reload" title="Reload">\u21BB</button>' +
-        '<button data-act="home" title="Home">\u2302</button>' +
-        '<input id="__sni_url" type="text" spellcheck="false" autocomplete="off" placeholder="https://...">' +
-        '<span id="__sni_status" title="SNI MITM active">\uD83D\uDD12 SNI</span>';
+    function build() {
+        if (!document.body) return;
+        if (document.getElementById('__sni_bar')) return;
 
-    bar.style.cssText =
-        'all:initial;position:fixed;top:0;left:0;right:0;height:' + H + 'px;' +
-        'background:#16161e;color:#ccc;display:flex;align-items:center;gap:4px;' +
-        'padding:0 8px;font:13px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;' +
-        'z-index:2147483647;box-shadow:0 1px 8px rgba(0,0,0,.5);box-sizing:border-box;';
+        var bar = document.createElement('div');
+        bar.id = '__sni_bar';
+        bar.innerHTML =
+            '<button data-act="back" title="Back">\u25C0</button>' +
+            '<button data-act="fwd" title="Forward">\u25B6</button>' +
+            '<button data-act="reload" title="Reload">\u21BB</button>' +
+            '<button data-act="home" title="Home">\u2302</button>' +
+            '<input id="__sni_url" type="text" spellcheck="false" autocomplete="off" placeholder="https://...">' +
+            '<span id="__sni_status" title="SNI MITM active">\uD83D\uDD12 SNI</span>';
 
-    var style = document.createElement('style');
-    style.textContent =
-        '#__sni_bar button{all:initial;font:14px/1 sans-serif;color:#bbb;background:#262633;' +
-        'border:1px solid #333;border-radius:6px;padding:5px 10px;cursor:pointer;' +
-        'min-width:30px;text-align:center;box-sizing:border-box;}' +
-        '#__sni_bar button:hover{background:#33334a;color:#fff;}' +
-        '#__sni_bar button:active{background:#44445e;}' +
-        '#__sni_bar input{flex:1;height:26px;background:#101018;border:1px solid #333;' +
-        'border-radius:13px;color:#eee;padding:0 12px;font:13px/1.2 sans-serif;' +
-        'outline:none;min-width:120px;box-sizing:border-box;}' +
-        '#__sni_bar input:focus{border-color:#4f8;}' +
-        '#__sni_bar #__sni_status{font:11px/1 sans-serif;color:#4f8;white-space:nowrap;padding:0 4px;}';
+        bar.style.cssText =
+            'all:initial;position:fixed;top:0;left:0;right:0;height:' + H + 'px;' +
+            'background:#16161e;color:#ccc;display:flex;align-items:center;gap:4px;' +
+            'padding:0 8px;font:13px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;' +
+            'z-index:2147483647;box-shadow:0 1px 8px rgba(0,0,0,.5);box-sizing:border-box;';
 
-    var spacer = document.createElement('div');
-    spacer.style.cssText = 'height:' + H + 'px;';
+        var style = document.createElement('style');
+        style.textContent =
+            '#__sni_bar button{all:initial;font:14px/1 sans-serif;color:#bbb;background:#262633;' +
+            'border:1px solid #333;border-radius:6px;padding:5px 10px;cursor:pointer;' +
+            'min-width:30px;text-align:center;box-sizing:border-box;}' +
+            '#__sni_bar button:hover{background:#33334a;color:#fff;}' +
+            '#__sni_bar button:active{background:#44445e;}' +
+            '#__sni_bar input{flex:1;height:26px;background:#101018;border:1px solid #333;' +
+            'border-radius:13px;color:#eee;padding:0 12px;font:13px/1.2 sans-serif;' +
+            'outline:none;min-width:120px;box-sizing:border-box;}' +
+            '#__sni_bar input:focus{border-color:#4f8;}' +
+            '#__sni_bar #__sni_status{font:11px/1 sans-serif;color:#4f8;white-space:nowrap;padding:0 4px;}';
 
-    var root = document.body;
-    root.insertBefore(style, root.firstChild);
-    root.insertBefore(spacer, root.firstChild);
-    root.insertBefore(bar, root.firstChild);
+        document.head.appendChild(style);
+        document.body.appendChild(bar);
 
-    var input = bar.querySelector('#__sni_url');
+        // Push the page down below the fixed toolbar without injecting a layout
+        // item into the page (avoids breaking flex/grid layouts on resize).
+        document.documentElement.style.paddingTop = H + 'px';
+        document.body.style.marginTop = '0';
 
-    function updateURL() { input.value = location.href; }
-    updateURL();
+        var input = bar.querySelector('#__sni_url');
 
-    var last = location.href;
-    setInterval(function () {
-        if (location.href !== last) { last = location.href; updateURL(); }
-    }, 300);
-    window.addEventListener('popstate', updateURL);
-    window.addEventListener('hashchange', updateURL);
+        function updateURL() { input.value = location.href; }
+        updateURL();
 
-    bar.addEventListener('click', function (e) {
-        var b = e.target.closest('button');
-        if (!b) return;
-        var act = b.getAttribute('data-act');
-        if (act === 'back') { history.back(); }
-        else if (act === 'fwd') { history.forward(); }
-        else if (act === 'reload') { location.reload(); }
-        else if (act === 'home') { location.href = 'https://www.google.com'; }
-    });
+        var last = location.href;
+        setInterval(function () {
+            if (location.href !== last) { last = location.href; updateURL(); }
+        }, 300);
+        window.addEventListener('popstate', updateURL);
+        window.addEventListener('hashchange', updateURL);
 
-    input.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') {
-            var u = input.value.trim();
-            if (!u) return;
-            if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(u)) u = 'https://' + u;
-            location.href = u;
-        }
-    });
+        bar.addEventListener('click', function (e) {
+            var b = e.target.closest('button');
+            if (!b) return;
+            var act = b.getAttribute('data-act');
+            if (act === 'back') { history.back(); }
+            else if (act === 'fwd') { history.forward(); }
+            else if (act === 'reload') { location.reload(); }
+            else if (act === 'home') { location.href = 'https://www.google.com'; }
+        });
 
-    document.addEventListener('keydown', function (e) {
-        if (e.ctrlKey && (e.key === 'l' || e.key === 'L')) {
-            e.preventDefault();
-            input.focus();
-            input.select();
-        }
-    });
+        input.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') {
+                var u = input.value.trim();
+                if (!u) return;
+                if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(u)) u = 'https://' + u;
+                location.href = u;
+            }
+        });
+
+        document.addEventListener('keydown', function (e) {
+            if (e.ctrlKey && (e.key === 'l' || e.key === 'L')) {
+                e.preventDefault();
+                input.focus();
+                input.select();
+            }
+        });
+    }
+
+    // At document-start the body may not exist yet.
+    if (document.body) {
+        build();
+    } else {
+        document.addEventListener('DOMContentLoaded', build);
+        window.addEventListener('load', build);
+        var t = setInterval(function () {
+            if (document.body) { clearInterval(t); build(); }
+        }, 100);
+    }
 })();

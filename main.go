@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 )
 
@@ -19,15 +20,30 @@ const banner = `
 `
 
 func main() {
-	log.SetFlags(0)
-	fmt.Print(banner)
+	log.SetFlags(log.LstdFlags)
 
-	// Resolve the per-user config dir for the CA.
+	// Resolve the per-user config dir for the CA and the log file.
 	cfgDir, err := os.UserConfigDir()
 	if err != nil {
 		cfgDir = os.TempDir()
 	}
 	cfgDir = filepath.Join(cfgDir, "sni-browser")
+
+	// Log to a file (and stderr) so GUI crashes are diagnosable.
+	setupLogging(cfgDir)
+	defer recoverAndLog()
+
+	fmt.Print(banner)
+
+	// On Windows the webview is WebView2; bail with a clear message if the
+	// runtime is missing rather than crashing silently.
+	if runtime.GOOS == "windows" && !webview2Available() {
+		log.Println("[main] WebView2 runtime not detected")
+		showErrorBox("SNI Browser",
+			"Microsoft Edge WebView2 runtime is required but was not detected.\n\n"+
+				"Install it from:\nhttps://developer.microsoft.com/microsoft-edge/webview2/")
+		return
+	}
 
 	// Load (or generate) the root CA the browser will trust for MITM.
 	ca, err := ensureCA(cfgDir)

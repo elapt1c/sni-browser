@@ -27,12 +27,20 @@ case "${1:-linux}" in
         echo "  → Built: ${BINARY}-windows-amd64.exe"
         ls -lh "${BINARY}-windows-amd64.exe"
         ;;
+    windows-console)
+        echo "→ Building for Windows amd64 (console, for debugging)..."
+        CGO_ENABLED=1 GOOS=windows GOARCH=amd64 \
+            CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+            go build -ldflags "$LDFLAGS" -o "${BINARY}-windows-console.exe" .
+        echo "  → Built: ${BINARY}-windows-console.exe"
+        ls -lh "${BINARY}-windows-console.exe"
+        ;;
     all)
         bash "$0" linux
         bash "$0" windows
         ;;
     *)
-        echo "Usage: $0 {linux|windows|all}"
+        echo "Usage: $0 {linux|windows|windows-console|all}"
         exit 1
         ;;
 esac

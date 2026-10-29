@@ -1,6 +1,7 @@
 # Binaries
 sni-browser-linux-amd64
 sni-browser-windows-amd64.exe
+sni-browser-windows-console.exe
 
 # Go
 *.o

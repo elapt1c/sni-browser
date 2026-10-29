@@ -4,7 +4,6 @@ import (
 	_ "embed"
 	"log"
 	"os"
-	"time"
 
 	"github.com/webview/webview_go"
 )
@@ -29,17 +28,11 @@ func runBrowser(proxyAddr string) {
 	w.SetTitle("SNI Browser")
 	w.SetSize(1280, 800, webview.HintNone)
 
-	// The webview resets its JS context on every navigation, so we
-	// periodically re-inject the browser-chrome script (toolbar + URL bar).
-	// The script is idempotent, so repeated injection is safe.
-	go func() {
-		for {
-			w.Dispatch(func() {
-				w.Eval(injectJS)
-			})
-			time.Sleep(400 * time.Millisecond)
-		}
-	}()
+	// Init registers the toolbar script to run at document-start on every
+	// top-frame page (WebKitGTK user-content manager / WebView2
+	// AddScriptToExecuteOnDocumentCreated), so it survives navigation without
+	// any polling. Must be called before the first Navigate.
+	w.Init(injectJS)
 
 	startURL := os.Getenv("SNI_BROWSER_START_URL")
 	if startURL == "" {
