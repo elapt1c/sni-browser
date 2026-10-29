@@ -20,6 +20,14 @@ func runBrowser(proxyAddr string) {
 	os.Setenv("https_proxy", proxyURL)
 	os.Setenv("no_proxy", "")
 
+	// Force the proxy at the WebView2 level so it wins over the Windows system
+	// proxy and any managed (group-policy) proxy on school/locked devices.
+	// SNI_BROWSER_PROXY is read by the vendored webview C++ and passed as
+	// --proxy-server (highest Chromium precedence). The env-var form is a
+	// fallback that WebView2 also honours.
+	os.Setenv("SNI_BROWSER_PROXY", proxyAddr)
+	os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--proxy-server="+proxyAddr)
+
 	debug := os.Getenv("SNI_BROWSER_DEBUG") == "1"
 
 	w := webview.New(debug)

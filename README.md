@@ -48,6 +48,16 @@ chain but skips the upstream cert-name check for those rules).
 - `Ctrl+L` focuses the URL bar; `Enter` navigates.
 - The URL bar shows a **🔒 SNI** indicator.
 
+## Managed devices (forced proxy)
+
+On locked-down Windows machines (e.g. school-managed) where group policy
+forces or disables the system proxy, the browser injects
+`--proxy-server=127.0.0.1:<port>` as a **WebView2 browser argument**. That
+switch has the highest precedence in Chromium, so the embedded proxy is used
+regardless of any system or managed proxy configuration. The library is
+vendored (`third_party/webview_go`) specifically to set
+`AdditionalBrowserArguments` at environment creation.
+
 ## Evasion rules
 
 Ported from the iBoss unblock mitmproxy addon (`iboss_unblock_addon.py`):
