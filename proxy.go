@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
@@ -12,18 +14,24 @@ import (
 	"time"
 )
 
-// Proxy is an HTTP/HTTPS forward proxy that rewrites the TLS SNI on outbound
-// connections according to the evasion rules.
+// Proxy is an HTTP/HTTPS forward proxy. For hosts that match an evasion rule
+// it performs a TLS MITM: the browser is served a certificate minted by our
+// CA, and the upstream connection is made with a spoofed SNI. All other hosts
+// are relayed transparently (no MITM).
 type Proxy struct {
 	Addr     string
 	Listener net.Listener
 	server   *http.Server
-	mu       sync.Mutex
+	ca       *CA
+	// RootCAs overrides the trust roots used for upstream (origin) TLS
+	// verification. nil means the system roots. Exposed for testing.
+	RootCAs *x509.CertPool
+	mu      sync.Mutex
 }
 
 // NewProxy creates a forward proxy on the given listen address.
-func NewProxy(addr string) *Proxy {
-	return &Proxy{Addr: addr}
+func NewProxy(addr string, ca *CA) *Proxy {
+	return &Proxy{Addr: addr, ca: ca}
 }
 
 // Start begins listening. It returns when the listener is ready.
@@ -80,10 +88,6 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
-// handleConnect handles CONNECT tunnels (HTTPS traffic). It is a transparent
-// tunnel: the proxy relays bytes end-to-end and, when a rule matches,
-// rewrites the SNI inside the client's first TLS ClientHello before it
-// reaches the server. No MITM certificates are involved.
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	hostPort := r.Host
 	if !strings.Contains(hostPort, ":") {
@@ -96,16 +100,91 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rule := matchEvasion(host)
+	if rule != nil {
+		p.handleMITM(w, host, port, rule)
+		return
+	}
+	p.handleTransparent(w, hostPort)
+}
 
-	// Resolve the target (optionally pinning the IP for rules that need it).
-	targetAddr := hostPort
-	if rule != nil && rule.IP != "" {
-		targetAddr = net.JoinHostPort(rule.IP, port)
+// handleMITM terminates the client TLS with a CA-signed leaf cert for the
+// original host, then dials upstream with a spoofed SNI and relays decrypted
+// bytes between the two TLS sessions. This is what makes the YouTube/Google
+// CDN family work: the browser sees a valid cert for youtube.com, while the
+// upstream handshake presents an allowed SNI.
+func (p *Proxy) handleMITM(w http.ResponseWriter, host, port string, rule *EvasionRule) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		return
+	}
+	clientRaw, bufrw, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	upstream, err := (&net.Dialer{Timeout: 15 * time.Second}).Dial("tcp", targetAddr)
+	bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+	bufrw.Flush()
+
+	leaf, err := p.ca.leafForHost(host)
 	if err != nil {
-		log.Printf("[proxy] CONNECT dial %s: %v", targetAddr, err)
+		log.Printf("[mitm] leaf cert %s: %v", host, err)
+		clientRaw.Close()
+		return
+	}
+
+	clientTLS := tls.Server(clientRaw, &tls.Config{
+		Certificates: []tls.Certificate{*leaf},
+		NextProtos:   []string{"http/1.1"},
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err := clientTLS.Handshake(); err != nil {
+		log.Printf("[mitm] client handshake %s: %v", host, err)
+		clientRaw.Close()
+		return
+	}
+
+	targetAddr := net.JoinHostPort(host, port)
+	if rule.IP != "" {
+		targetAddr = net.JoinHostPort(rule.IP, port)
+	}
+	upstreamRaw, err := (&net.Dialer{Timeout: 15 * time.Second}).Dial("tcp", targetAddr)
+	if err != nil {
+		log.Printf("[mitm] upstream dial %s: %v", targetAddr, err)
+		clientTLS.Close()
+		return
+	}
+
+	relaxed := rule.Relaxed
+	upCfg := &tls.Config{
+		ServerName:         rule.SNI,
+		InsecureSkipVerify: relaxed,
+		RootCAs:            p.RootCAs,
+		NextProtos:         []string{"http/1.1"},
+		MinVersion:         tls.VersionTLS12,
+	}
+	if relaxed {
+		upCfg.VerifyPeerCertificate = buildRelaxedVerifier(p.RootCAs)
+	}
+	upstreamTLS := tls.Client(upstreamRaw, upCfg)
+	if err := upstreamTLS.Handshake(); err != nil {
+		log.Printf("[mitm] upstream handshake %s (SNI=%s): %v", host, rule.SNI, err)
+		upstreamRaw.Close()
+		clientTLS.Close()
+		return
+	}
+
+	log.Printf("[mitm] CONNECT %s → SNI=%s (MITM)", host, rule.SNI)
+	relayTLS(clientTLS, upstreamTLS)
+}
+
+// handleTransparent is a blind splice for non-evasion hosts: no MITM, just a
+// byte relay between the browser and the origin.
+func (p *Proxy) handleTransparent(w http.ResponseWriter, hostPort string) {
+	upstream, err := (&net.Dialer{Timeout: 15 * time.Second}).Dial("tcp", hostPort)
+	if err != nil {
+		log.Printf("[proxy] CONNECT dial %s: %v", hostPort, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -125,36 +204,19 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 	bufrw.Flush()
+	log.Printf("[proxy] CONNECT %s (passthrough)", hostPort)
 
-	if rule != nil {
-		log.Printf("[proxy] CONNECT %s → SNI=%s (rewrite)", hostPort, rule.SNI)
-	} else {
-		log.Printf("[proxy] CONNECT %s (passthrough)", hostPort)
-	}
-
-	relayBidirectional(client, upstream, rule)
-}
-
-// relayBidirectional copies bytes in both directions using half-closes so an
-// EOF from one side is propagated to the other without truncating the reply.
-func relayBidirectional(client, upstream net.Conn, rule *EvasionRule) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	go func() {
 		defer wg.Done()
-		if rule != nil {
-			relayClientToUpstreamWithRewrite(client, upstream, rule.SNI)
-		} else {
-			io.Copy(upstream, client)
-		}
+		io.Copy(upstream, client)
 		if c, ok := upstream.(*net.TCPConn); ok {
 			c.CloseWrite()
 		} else {
 			upstream.Close()
 		}
 	}()
-
 	go func() {
 		defer wg.Done()
 		io.Copy(client, upstream)
@@ -164,55 +226,59 @@ func relayBidirectional(client, upstream net.Conn, rule *EvasionRule) {
 			client.Close()
 		}
 	}()
-
 	wg.Wait()
 	client.Close()
 	upstream.Close()
 }
 
-// relayClientToUpstreamWithRewrite buffers the client's first TLS flight until
-// a complete ClientHello is available, rewrites its SNI to newSNI, forwards it,
-// then relays the rest verbatim.
-func relayClientToUpstreamWithRewrite(client, upstream net.Conn, newSNI string) {
-	buf := make([]byte, 0, 16384)
-	tmp := make([]byte, 16384)
+// relayTLS pipes decrypted bytes between two TLS connections. Closing one side
+// once either direction finishes unblocks the other (HTTP/1.1 responses are
+// self-delimiting, so no half-close is needed).
+func relayTLS(a, b *tls.Conn) {
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(b, a)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(a, b)
+		done <- struct{}{}
+	}()
+	<-done
+	a.Close()
+	b.Close()
+}
 
-	for {
-		n, err := client.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			out, changed, complete, perr := rewriteClientHelloSNI(buf, newSNI)
-			if perr != nil {
-				log.Printf("[proxy] SNI rewrite parse error: %v (forwarding unchanged)", perr)
-				upstream.Write(buf)
-				buf = buf[:0]
-				break
-			}
-			if complete {
-				if changed {
-					log.Printf("[proxy] SNI rewritten to %s", newSNI)
-				}
-				upstream.Write(out)
-				buf = buf[:0]
-				break
-			}
-			// incomplete — keep buffering and read more.
+// buildRelaxedVerifier returns a VerifyPeerCertificate hook that skips the
+// hostname check but still validates the certificate chain against the given
+// roots (nil = system roots). This mirrors mitmproxy's "keep chain validation,
+// drop cert-name check" for YouTube/Google CDN edges that serve a fixed cert
+// unrelated to the allowed evasion SNI.
+func buildRelaxedVerifier(roots *x509.CertPool) func([][]byte, [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return fmt.Errorf("no certificates presented")
 		}
-		if err != nil {
-			if len(buf) > 0 {
-				upstream.Write(buf)
+		certs := make([]*x509.Certificate, 0, len(rawCerts))
+		intermediates := x509.NewCertPool()
+		for i, raw := range rawCerts {
+			c, err := x509.ParseCertificate(raw)
+			if err != nil {
+				return fmt.Errorf("parse cert %d: %w", i, err)
 			}
-			return
+			certs = append(certs, c)
+			if i > 0 {
+				intermediates.AddCert(c)
+			}
 		}
-		if len(buf) > 64*1024 {
-			// Sanity cap: forward as-is rather than buffer indefinitely.
-			upstream.Write(buf)
-			buf = buf[:0]
-			break
-		}
+		// No DNSName → hostname check is skipped; chain still validated.
+		_, err := certs[0].Verify(x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: intermediates,
+			CurrentTime:   time.Now(),
+		})
+		return err
 	}
-
-	io.Copy(upstream, client)
 }
 
 // ParseProxyURL parses the proxy's listen address to an http.ProxyURL function.

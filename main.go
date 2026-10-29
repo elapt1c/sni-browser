@@ -6,16 +6,15 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 )
 
 const banner = `
   ╔══════════════════════════════════════════╗
-  ║         SNI BROWSER v1.0.0              ║
-  ║  All HTTPS SNI is spoofed through       ║
-  ║  the embedded evasion proxy.            ║
-  ║  Keyboard: Ctrl+L=URL  Alt+←=Back       ║
-  ║            Alt+→=Fwd  F5=Reload         ║
+  ║         SNI BROWSER v1.1.0              ║
+  ║  MITM SNI-spoofing evasion browser      ║
+  ║  (YouTube / WordPress / Reddit work)    ║
   ╚══════════════════════════════════════════╝
 `
 
@@ -23,11 +22,29 @@ func main() {
 	log.SetFlags(0)
 	fmt.Print(banner)
 
+	// Resolve the per-user config dir for the CA.
+	cfgDir, err := os.UserConfigDir()
+	if err != nil {
+		cfgDir = os.TempDir()
+	}
+	cfgDir = filepath.Join(cfgDir, "sni-browser")
+
+	// Load (or generate) the root CA the browser will trust for MITM.
+	ca, err := ensureCA(cfgDir)
+	if err != nil {
+		log.Fatalf("failed to load/generate CA: %v", err)
+	}
+
+	// Install/trust the CA for the browser engine.
+	if err := trustCA(ca); err != nil {
+		log.Printf("[main] warning: could not install CA trust: %v", err)
+	}
+
 	// Find a free port for the proxy.
 	proxyAddr := findFreePort()
 
-	// Start the SNI-spoofing forward proxy.
-	proxy := NewProxy(proxyAddr)
+	// Start the MITM forward proxy.
+	proxy := NewProxy(proxyAddr, ca)
 	if err := proxy.Start(); err != nil {
 		log.Fatalf("failed to start proxy: %v", err)
 	}

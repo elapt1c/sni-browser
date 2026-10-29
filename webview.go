@@ -2,10 +2,8 @@ package main
 
 import (
 	_ "embed"
-	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/webview/webview_go"
@@ -28,30 +26,12 @@ func runBrowser(proxyAddr string) {
 	w := webview.New(debug)
 	defer w.Destroy()
 
-	w.SetTitle("SNI Browser — all HTTPS traffic SNI-spoofed")
+	w.SetTitle("SNI Browser")
 	w.SetSize(1280, 800, webview.HintNone)
 
-	// Bind a URL navigator.
-	w.Bind("navigateTo", func(raw string) {
-		url := strings.TrimSpace(raw)
-		if url == "" {
-			return
-		}
-		if !strings.Contains(url, "://") {
-			url = "https://" + url
-		}
-		w.Navigate(url)
-	})
-
-	// Bind current-url reporter for the title bar.
-	w.Bind("reportURL", func(u string) {
-		w.SetTitle(fmt.Sprintf("SNI Browser — %s", u))
-	})
-
 	// The webview resets its JS context on every navigation, so we
-	// periodically re-inject the keyboard-shortcut/URL-bar script. The
-	// script is idempotent (guards on window.__sni_injected), so it is
-	// safe to run repeatedly.
+	// periodically re-inject the browser-chrome script (toolbar + URL bar).
+	// The script is idempotent, so repeated injection is safe.
 	go func() {
 		for {
 			w.Dispatch(func() {
@@ -61,9 +41,12 @@ func runBrowser(proxyAddr string) {
 		}
 	}()
 
-	w.Navigate("https://www.google.com")
+	startURL := os.Getenv("SNI_BROWSER_START_URL")
+	if startURL == "" {
+		startURL = "https://www.google.com"
+	}
+	w.Navigate(startURL)
 
 	log.Println("[browser] WebView started, proxying all traffic through", proxyAddr)
-	log.Println("[browser] Ctrl+L = URL bar, Alt+Left/Right = back/forward, F5 = reload")
 	w.Run()
 }
