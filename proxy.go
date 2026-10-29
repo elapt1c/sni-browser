@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
@@ -14,8 +12,8 @@ import (
 	"time"
 )
 
-// Proxy is an HTTP/HTTPS forward proxy that rewrites SNI on outbound
-// TLS connections according to the evasion rules.
+// Proxy is an HTTP/HTTPS forward proxy that rewrites the TLS SNI on outbound
+// connections according to the evasion rules.
 type Proxy struct {
 	Addr     string
 	Listener net.Listener
@@ -82,12 +80,14 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
-// handleConnect handles CONNECT tunnels (HTTPS traffic).
-// It dials the target, optionally rewriting the SNI, then relays bytes.
+// handleConnect handles CONNECT tunnels (HTTPS traffic). It is a transparent
+// tunnel: the proxy relays bytes end-to-end and, when a rule matches,
+// rewrites the SNI inside the client's first TLS ClientHello before it
+// reaches the server. No MITM certificates are involved.
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	hostPort := r.Host
 	if !strings.Contains(hostPort, ":") {
-		hostPort = hostPort + ":443"
+		hostPort += ":443"
 	}
 	host, port, err := net.SplitHostPort(hostPort)
 	if err != nil {
@@ -95,110 +95,124 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check evasion rules for this host.
 	rule := matchEvasion(host)
 
-	// Determine target address.
+	// Resolve the target (optionally pinning the IP for rules that need it).
 	targetAddr := hostPort
 	if rule != nil && rule.IP != "" {
 		targetAddr = net.JoinHostPort(rule.IP, port)
 	}
 
-	// Resolve target.
-	tcpConn, err := (&net.Dialer{Timeout: 15 * time.Second}).Dial("tcp", targetAddr)
+	upstream, err := (&net.Dialer{Timeout: 15 * time.Second}).Dial("tcp", targetAddr)
 	if err != nil {
 		log.Printf("[proxy] CONNECT dial %s: %v", targetAddr, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 
-	// Build TLS config with optional SNI spoofing.
-	sni := host
-	if rule != nil {
-		sni = rule.SNI
-	}
-
-	relaxed := rule != nil && rule.Relaxed
-	tlsCfg := &tls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: relaxed,
-		MinVersion:         tls.VersionTLS12,
-	}
-	if relaxed {
-		tlsCfg.VerifyPeerCertificate = buildRelaxedVerifier()
-	}
-
-	tlsConn := tls.Client(tcpConn, tlsCfg)
-	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("[proxy] TLS handshake to %s (SNI=%s): %v", hostPort, sni, err)
-		tcpConn.Close()
-		http.Error(w, "TLS handshake failed", http.StatusBadGateway)
-		return
-	}
-
-	// Hijack the client connection.
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
+		upstream.Close()
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
-		tlsConn.Close()
 		return
 	}
-	clientConn, bufrw, err := hijacker.Hijack()
+	client, bufrw, err := hijacker.Hijack()
 	if err != nil {
+		upstream.Close()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		tlsConn.Close()
 		return
 	}
 
-	// Send 200 to client.
 	bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 	bufrw.Flush()
 
 	if rule != nil {
-		log.Printf("[proxy] CONNECT %s → SNI=%s (evasion)", hostPort, sni)
+		log.Printf("[proxy] CONNECT %s → SNI=%s (rewrite)", hostPort, rule.SNI)
 	} else {
 		log.Printf("[proxy] CONNECT %s (passthrough)", hostPort)
 	}
 
-	// Relay.
-	go func() {
-		io.Copy(tlsConn, clientConn)
-		tlsConn.Close()
-	}()
-	io.Copy(clientConn, tlsConn)
-	clientConn.Close()
+	relayBidirectional(client, upstream, rule)
 }
 
-// buildRelaxedVerifier returns a VerifyPeerCertificate hook that skips the
-// hostname check but still validates the certificate chain against the
-// system roots. This mirrors mitmproxy's "keep chain validation, drop
-// cert-name check" for YouTube/Google CDN edges that serve a fixed cert
-// unrelated to the allowed evasion SNI.
-func buildRelaxedVerifier() func([][]byte, [][]*x509.Certificate) error {
-	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-		if len(rawCerts) == 0 {
-			return fmt.Errorf("no certificates presented")
+// relayBidirectional copies bytes in both directions using half-closes so an
+// EOF from one side is propagated to the other without truncating the reply.
+func relayBidirectional(client, upstream net.Conn, rule *EvasionRule) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		if rule != nil {
+			relayClientToUpstreamWithRewrite(client, upstream, rule.SNI)
+		} else {
+			io.Copy(upstream, client)
 		}
-		certs := make([]*x509.Certificate, 0, len(rawCerts))
-		intermediates := x509.NewCertPool()
-		for i, raw := range rawCerts {
-			c, err := x509.ParseCertificate(raw)
-			if err != nil {
-				return fmt.Errorf("parse cert %d: %w", i, err)
-			}
-			certs = append(certs, c)
-			if i > 0 {
-				intermediates.AddCert(c)
-			}
+		if c, ok := upstream.(*net.TCPConn); ok {
+			c.CloseWrite()
+		} else {
+			upstream.Close()
 		}
-		// No DNSName → hostname check is skipped; chain still validated.
-		_, err := certs[0].Verify(x509.VerifyOptions{
-			Roots:         nil, // system roots
-			Intermediates: intermediates,
-			CurrentTime:   time.Now(),
-		})
-		return err
+	}()
+
+	go func() {
+		defer wg.Done()
+		io.Copy(client, upstream)
+		if c, ok := client.(*net.TCPConn); ok {
+			c.CloseWrite()
+		} else {
+			client.Close()
+		}
+	}()
+
+	wg.Wait()
+	client.Close()
+	upstream.Close()
+}
+
+// relayClientToUpstreamWithRewrite buffers the client's first TLS flight until
+// a complete ClientHello is available, rewrites its SNI to newSNI, forwards it,
+// then relays the rest verbatim.
+func relayClientToUpstreamWithRewrite(client, upstream net.Conn, newSNI string) {
+	buf := make([]byte, 0, 16384)
+	tmp := make([]byte, 16384)
+
+	for {
+		n, err := client.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			out, changed, complete, perr := rewriteClientHelloSNI(buf, newSNI)
+			if perr != nil {
+				log.Printf("[proxy] SNI rewrite parse error: %v (forwarding unchanged)", perr)
+				upstream.Write(buf)
+				buf = buf[:0]
+				break
+			}
+			if complete {
+				if changed {
+					log.Printf("[proxy] SNI rewritten to %s", newSNI)
+				}
+				upstream.Write(out)
+				buf = buf[:0]
+				break
+			}
+			// incomplete — keep buffering and read more.
+		}
+		if err != nil {
+			if len(buf) > 0 {
+				upstream.Write(buf)
+			}
+			return
+		}
+		if len(buf) > 64*1024 {
+			// Sanity cap: forward as-is rather than buffer indefinitely.
+			upstream.Write(buf)
+			buf = buf[:0]
+			break
+		}
 	}
+
+	io.Copy(upstream, client)
 }
 
 // ParseProxyURL parses the proxy's listen address to an http.ProxyURL function.

@@ -7,10 +7,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"io"
 	"math/big"
 	"net"
+	"net/http"
+	"net/url"
+	"sync"
 	"testing"
 	"time"
 )
@@ -42,21 +46,173 @@ func TestEvasionMatching(t *testing.T) {
 	}
 }
 
-// TestProxySNISpoofing starts a TLS server that records the ClientHello SNI,
-// dials it with the proxy's spoofed-SNI TLS config, and asserts the server
-// observed the spoofed SNI (not the real hostname).
-func TestProxySNISpoofing(t *testing.T) {
-	var receivedSNI string
+// TestRewriteClientHelloSNI captures a real TLS ClientHello, rewrites its SNI,
+// feeds the result to a TLS server, and asserts the server observed the
+// spoofed SNI.
+func TestRewriteClientHelloSNI(t *testing.T) {
+	cases := []struct{ orig, want string }{
+		{"wordpress.com", "en.wordpress.com"}, // longer replacement
+		{"youtube.com", "www.google.com"},     // longer replacement
+		{"reddit.com", "alb.reddit.com"},      // longer replacement
+		{"crates.io", "alb.reddit.com"},       // longer replacement
+		{"abcdefghijklmnop.com", "x.io"},      // shorter replacement
+	}
+	for _, tc := range cases {
+		hello := captureClientHello(t, tc.orig)
+		out, changed, complete, err := rewriteClientHelloSNI(hello, tc.want)
+		if err != nil {
+			t.Fatalf("%s→%s: rewrite error: %v", tc.orig, tc.want, err)
+		}
+		if !complete {
+			t.Fatalf("%s→%s: expected complete=true", tc.orig, tc.want)
+		}
+		if !changed {
+			t.Fatalf("%s→%s: expected changed=true", tc.orig, tc.want)
+		}
+		got := serverSNIFromRaw(t, out)
+		if got != tc.want {
+			t.Errorf("%s→%s: server parsed SNI %q, want %q", tc.orig, tc.want, got, tc.want)
+		}
+	}
+}
+
+// TestRewriteClientHelloSNINoChange verifies the rewriter is a no-op when the
+// SNI already matches the target.
+func TestRewriteClientHelloSNINoChange(t *testing.T) {
+	hello := captureClientHello(t, "www.google.com")
+	out, changed, complete, err := rewriteClientHelloSNI(hello, "www.google.com")
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if !complete {
+		t.Fatal("expected complete=true")
+	}
+	if changed {
+		t.Fatal("expected changed=false when SNI already equals target")
+	}
+	if string(out) != string(hello) {
+		t.Fatal("output should be byte-identical when no change")
+	}
+}
+
+// TestProxyEndToEnd verifies the full CONNECT → relay path: an HTTPS request
+// made through the proxy reaches a local TLS server and the response returns
+// intact (regression for the double-TLS "unexpected TLS packet" bug).
+func TestProxyEndToEnd(t *testing.T) {
+	cert := selfSignedCert(t)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("hello via sni-browser proxy"))
+		}),
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+	}
+	srvLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.ServeTLS(srvLn, "", "")
+	defer srv.Close()
+
+	proxy := NewProxy("127.0.0.1:0")
+	if err := proxy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Stop()
+	proxyAddr := proxy.Listener.Addr().String()
+
+	proxyURL, _ := url.Parse("http://" + proxyAddr)
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Get("https://" + srvLn.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("GET via proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "hello via sni-browser proxy" {
+		t.Errorf("unexpected body: %q", body)
+	}
+}
+
+// captureClientHello opens a TCP listener, drives a tls.Client handshake, and
+// returns the raw ClientHello bytes the client sent.
+func captureClientHello(t *testing.T, sni string) []byte {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var mu sync.Mutex
+	var captured []byte
 	done := make(chan struct{})
 
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 0, 65536)
+		tmp := make([]byte, 4096)
+		for {
+			n, err := conn.Read(tmp)
+			if n > 0 {
+				buf = append(buf, tmp[:n]...)
+			}
+			// Stop once we have a full TLS record.
+			if len(buf) >= 5 && len(buf) >= 5+int(binary.BigEndian.Uint16(buf[3:5])) {
+				break
+			}
+			if err != nil {
+				break
+			}
+		}
+		mu.Lock()
+		captured = buf
+		mu.Unlock()
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := tls.Client(conn, &tls.Config{ServerName: sni, InsecureSkipVerify: true})
+	_ = client.Handshake() // sends ClientHello, then errors once the server closes
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout capturing ClientHello")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	return captured
+}
+
+// serverSNIFromRaw feeds raw ClientHello bytes to a TLS server and returns the
+// SNI the server parsed.
+func serverSNIFromRaw(t *testing.T, raw []byte) string {
+	t.Helper()
+	var sni string
+	done := make(chan struct{})
 	cert := selfSignedCert(t)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("listen: %v", err)
+		t.Fatal(err)
 	}
 	defer ln.Close()
-	targetAddr := ln.Addr().String()
 
 	go func() {
 		defer close(done)
@@ -68,56 +224,26 @@ func TestProxySNISpoofing(t *testing.T) {
 		tlsConn := tls.Server(conn, &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-				receivedSNI = hello.ServerName
+				sni = hello.ServerName
 				return nil, nil
 			},
 		})
-		if err := tlsConn.Handshake(); err != nil {
-			return
-		}
-		io.Copy(io.Discard, tlsConn)
+		_ = tlsConn.Handshake() // parses the ClientHello; write side may fail after we close
 	}()
 
-	// Mirror the proxy's SNI-spoofing dial path for wordpress.com
-	// (relaxed=false, so the default cert verification path applies).
-	sni, _, _ := spoofForHost("wordpress.com")
-	if sni != "en.wordpress.com" {
-		t.Fatalf("spoofForHost(wordpress.com) SNI = %q, want en.wordpress.com", sni)
-	}
-
-	tcpConn, err := net.Dial("tcp", targetAddr)
+	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		t.Fatalf("dial target: %v", err)
+		t.Fatal(err)
 	}
-	tlsCfg := &tls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: true, // self-signed test cert
-		MinVersion:         tls.VersionTLS12,
-	}
-	tlsClient := tls.Client(tcpConn, tlsCfg)
-	if err := tlsClient.Handshake(); err != nil {
-		t.Fatalf("handshake: %v", err)
-	}
-	tlsClient.Close()
+	_, _ = conn.Write(raw)
+	_ = conn.Close()
 
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for server")
 	}
-
-	if receivedSNI != "en.wordpress.com" {
-		t.Errorf("server received SNI %q, want %q (spoofed)", receivedSNI, "en.wordpress.com")
-	}
-}
-
-// spoofForHost returns the (sni, ip, relaxed) for a host, matching the
-// proxy's evasion logic.
-func spoofForHost(host string) (string, string, bool) {
-	if r := matchEvasion(host); r != nil {
-		return r.SNI, r.IP, r.Relaxed
-	}
-	return host, "", false
+	return sni
 }
 
 func selfSignedCert(t *testing.T) tls.Certificate {
